@@ -1,0 +1,13 @@
+[package]
+name = "kaleidoscope"
+version = "0.1.0"
+authors = ["Paul Lesur <git@lesurpaul.fr>"]
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+nom = { path = "/home/lesurp/Clones/nom" }
+#nom = "5.1.1"
+log = "0.4.8"
+env_logger = "0.7.1"
