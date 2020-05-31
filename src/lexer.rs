@@ -1,10 +1,14 @@
 use log::debug;
 use std::io::BufRead;
-use std::ops::{Generator, GeneratorState};
-use std::pin::Pin;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LexingError {
+    IncompleteToken,
+    IoError,
+}
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum Token {
+pub enum LexerToken {
     Def,
     Extern,
     Ident(String),
@@ -15,7 +19,7 @@ pub enum Token {
 pub struct Lexer<'a, R: BufRead> {
     input: &'a mut R,
     toparse_buf: String,
-    parsed_buf: Vec<Option<Token>>,
+    pub parsed_buf: Vec<Option<LexerToken>>,
 }
 
 fn is_ident_accepted(c: char) -> bool {
@@ -28,29 +32,29 @@ fn is_ident_accepted(c: char) -> bool {
 /// That is unless we check if there are whitespaces, but then we never when those should
 /// actually be trimmed...
 /// TODO: allow digit WITHIN the ident
-fn take_ident(s: &str) -> nom::IResult<&str, Token> {
+fn take_ident(s: &str) -> nom::IResult<&str, LexerToken> {
     nom::bytes::complete::take_while1(is_ident_accepted)(s).map(|(reminder, ident)| {
         (
             reminder,
             match ident {
-                "extern" => Token::Extern,
-                "def" => Token::Def,
-                s => Token::Ident(s.into()),
+                "extern" => LexerToken::Extern,
+                "def" => LexerToken::Def,
+                s => LexerToken::Ident(s.into()),
             },
         )
     })
 }
 
-fn take_char(s: &str) -> nom::IResult<&str, Token> {
-    nom::bytes::complete::take(1usize)(s)
-        .map(|(reminder, chr)| (reminder, Token::Kwd(chr.chars().next().unwrap())))
+fn take_kwd(s: &str) -> nom::IResult<&str, LexerToken> {
+    nom::character::complete::none_of("0123456789")(s)
+        .map(|(reminder, chr)| (reminder, LexerToken::Kwd(chr)))
 }
 
-fn take_double(s: &str) -> nom::IResult<&str, Token> {
+fn take_double(s: &str) -> nom::IResult<&str, LexerToken> {
     match nom::number::complete::double(s) {
         Ok((reminder, val)) => {
             if val.is_finite() {
-                nom::IResult::Ok((reminder, Token::Number(val)))
+                nom::IResult::Ok((reminder, LexerToken::Number(val)))
             } else {
                 nom::IResult::Err(nom::Err::Error((s, nom::error::ErrorKind::Float)))
             }
@@ -59,8 +63,19 @@ fn take_double(s: &str) -> nom::IResult<&str, Token> {
     }
 }
 
-fn parse_token(s: &str) -> nom::IResult<&str, Token> {
-    nom::branch::alt((take_ident, take_double, take_char))(s)
+fn parse_token(s: &str) -> nom::IResult<&str, LexerToken> {
+    nom::branch::alt((take_ident, take_kwd, take_double))(s)
+}
+
+pub struct LexerTokenView<'a, 'b, R: BufRead>(&'a mut Lexer<'b, R>);
+impl<'a, 'b, R: BufRead> LexerTokenView<'a, 'b, R> {
+    pub fn peek(&self) -> Option<&LexerToken> {
+        self.0.parsed_buf.first().unwrap().as_ref()
+    }
+
+    pub fn consume(self) -> Option<LexerToken> {
+        self.0.parsed_buf.remove(0)
+    }
 }
 
 impl<'a, R: BufRead> Lexer<'a, R> {
@@ -76,7 +91,12 @@ impl<'a, R: BufRead> Lexer<'a, R> {
         self.toparse_buf.is_empty() || self.toparse_buf.trim_start().is_empty()
     }
 
-    pub fn token(&mut self) -> Result<Option<Token>, ()> {
+    pub fn token_view<'b>(&'b mut self) -> Result<LexerTokenView<'b, 'a, R>, LexingError> {
+        self.peek()?;
+        Ok(LexerTokenView(self))
+    }
+
+    pub fn token(&mut self) -> Result<Option<LexerToken>, LexingError> {
         if self.parsed_buf.is_empty() {
             self.next_token()
         } else {
@@ -84,16 +104,12 @@ impl<'a, R: BufRead> Lexer<'a, R> {
         }
     }
 
-    pub fn peek_cur(&mut self) -> Result<&Option<Token>, ()> {
+    pub fn peek(&mut self) -> Result<&Option<LexerToken>, LexingError> {
         self.peek_nth(0)
     }
 
-    pub fn peek_next(&mut self) -> Result<&Option<Token>, ()> {
-        self.peek_nth(1)
-    }
-
-    pub fn peek_nth(&mut self, n: usize) -> Result<&Option<Token>, ()> {
-        while self.parsed_buf.len() < n {
+    pub fn peek_nth(&mut self, n: usize) -> Result<&Option<LexerToken>, LexingError> {
+        while self.parsed_buf.len() < n + 1 {
             let t = self.next_token()?;
             self.parsed_buf.push(t);
         }
@@ -101,7 +117,7 @@ impl<'a, R: BufRead> Lexer<'a, R> {
         Ok(self.parsed_buf.get(n).unwrap())
     }
 
-    fn next_token(&mut self) -> Result<Option<Token>, ()> {
+    fn next_token(&mut self) -> Result<Option<LexerToken>, LexingError> {
         debug!("Trying to parse: '{}'", self.toparse_buf);
 
         match parse_token(self.toparse_buf.trim_start()) {
@@ -126,14 +142,14 @@ impl<'a, R: BufRead> Lexer<'a, R> {
                             // Otherwise, since we failed to parse the leftovers, and we reached EOF, that means
                             // the last token is an error
                             debug!("Nothing left to read but buffer is not empty; error :(");
-                            return Err(());
+                            return Err(LexingError::IncompleteToken);
                         }
                     }
                     Ok(_) => {}
                     Err(_) => {
                         // Error reading another line - client code's problem
                         debug!("Could not read line from the BufRead");
-                        return Err(());
+                        return Err(LexingError::IoError);
                     }
                 }
 
@@ -151,46 +167,6 @@ impl<'a, R: BufRead> Lexer<'a, R> {
         // hopefully it's gonna be tail-recursion optimized 😁
         self.next_token()
     }
-
-    pub fn into_iter(self) -> GeneratorIteratorAdapter<Self> {
-        GeneratorIteratorAdapter::new(self)
-    }
-}
-
-impl<'a, R: BufRead> Generator for Lexer<'a, R> {
-    type Yield = Result<Token, ()>;
-    type Return = ();
-    fn resume(self: Pin<&mut Self>, _: ()) -> GeneratorState<Self::Yield, Self::Return> {
-        match Pin::into_inner(self).token() {
-            Ok(Some(t)) => GeneratorState::Yielded(Ok(t)),
-            Err(e) => GeneratorState::Yielded(Err(e)),
-            Ok(None) => GeneratorState::Complete(()),
-        }
-    }
-}
-
-pub struct GeneratorIteratorAdapter<G>(Pin<Box<G>>);
-impl<G> GeneratorIteratorAdapter<G>
-where
-    G: Generator<Return = ()>,
-{
-    pub fn new(gen: G) -> Self {
-        Self(Box::pin(gen))
-    }
-}
-
-impl<G> Iterator for GeneratorIteratorAdapter<G>
-where
-    G: Generator<Return = ()>,
-{
-    type Item = G::Yield;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        match self.0.as_mut().resume(()) {
-            GeneratorState::Yielded(x) => Some(x),
-            GeneratorState::Complete(_) => None,
-        }
-    }
 }
 
 #[cfg(test)]
@@ -198,33 +174,33 @@ mod test {
     use super::*;
 
     #[test]
-    fn parse_def_ok() {
+    fn lex_def_ok() {
         let defs = vec!["def", "\tdef", "\t\tdef", "\t     \tdef\t"];
 
         for def in defs {
             let mut s = def.as_bytes();
             let mut lexer = Lexer::new(&mut s);
-            assert_eq!(lexer.next_token().unwrap().unwrap(), Token::Def);
+            assert_eq!(lexer.next_token().unwrap().unwrap(), LexerToken::Def);
             assert_eq!(lexer.next_token(), Ok(None));
         }
     }
 
     #[test]
-    fn parse_extern_ok() {
+    fn lex_extern_ok() {
         let externs = vec!["extern", "\textern", "\t\textern", "\t     \textern\t"];
 
         for extern_ in externs {
             let mut s = extern_.as_bytes();
             let mut lexer = Lexer::new(&mut s);
-            assert_eq!(lexer.next_token().unwrap().unwrap(), Token::Extern);
+            assert_eq!(lexer.next_token().unwrap().unwrap(), LexerToken::Extern);
             assert_eq!(lexer.next_token(), Ok(None));
         }
     }
 
     #[test]
-    fn parse_f64_ok() {
+    fn lex_f64_ok() {
         //env_logger::init();
-        let floats = vec![1.0, -2.0, 1e245, -4.1554e-1, 90e-90];
+        let floats = vec![1.0, 2.0, 1e245, 4.1554e-1, 90e-90];
 
         for f in floats {
             let s = f.to_string();
@@ -232,7 +208,7 @@ mod test {
             let mut lexer = Lexer::new(&mut sb);
             debug!("OK{}", s);
             match lexer.next_token().unwrap().unwrap() {
-                Token::Number(val) => {
+                LexerToken::Number(val) => {
                     assert_eq!(val, f);
                 }
                 _ => unreachable!(),
@@ -242,7 +218,7 @@ mod test {
     }
 
     #[test]
-    fn parse_f64_nok() {
+    fn lex_f64_nok() {
         //env_logger::init();
         let floats = vec![std::f64::NAN, std::f64::INFINITY, std::f64::NEG_INFINITY];
 
@@ -253,13 +229,13 @@ mod test {
             debug!("OK{}", s);
             assert!(!matches!(
                 lexer.next_token().unwrap().unwrap(),
-                Token::Number(_)
+                LexerToken::Number(_)
             ));
         }
     }
 
     #[test]
-    fn parse_ident_ok() {
+    fn lex_ident_ok() {
         let idents = vec![
             "qwe",
             "\t\n  \n QWQWEASD \t \t \n",
@@ -275,14 +251,32 @@ mod test {
             let mut lexer = Lexer::new(&mut s);
             assert_eq!(
                 lexer.next_token().unwrap().unwrap(),
-                Token::Ident(i.trim().to_owned())
+                LexerToken::Ident(i.trim().to_owned())
             );
             assert_eq!(lexer.next_token(), Ok(None));
         }
     }
 
     #[test]
-    fn parse_kwd_ok() {
+    fn lex_signed_float_ok() {
+        let s = vec!["+123", "-4.3"];
+
+        for s in s {
+            let mut sb = s.as_bytes();
+            let mut lexer = Lexer::new(&mut sb);
+            assert_eq!(
+                lexer.next_token().unwrap().unwrap(),
+                LexerToken::Kwd(s.chars().next().unwrap())
+            );
+            assert!(matches!(
+                lexer.next_token().unwrap().unwrap(),
+                LexerToken::Number(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn lex_kwd_ok() {
         let kwds = vec!["+", "-", "("];
 
         for k in kwds {
@@ -290,7 +284,7 @@ mod test {
             let mut lexer = Lexer::new(&mut s);
             assert_eq!(
                 lexer.next_token().unwrap().unwrap(),
-                Token::Kwd(k.chars().next().unwrap())
+                LexerToken::Kwd(k.chars().next().unwrap())
             );
             assert_eq!(lexer.next_token(), Ok(None));
         }
