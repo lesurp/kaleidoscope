@@ -23,6 +23,8 @@ impl<'a, L: LexerTrait> IntoIterator for AstGenerator<'a, L> {
     }
 }
 
+pub struct AstGenerator<'a, L: LexerTrait>(pub &'a mut L);
+
 pub struct GeneratorIteratorAdapter<G: Generator>(Pin<Box<G>>);
 impl<G: Generator> Iterator for GeneratorIteratorAdapter<G> {
     type Item = G::Yield;
@@ -90,26 +92,21 @@ fn precedence(c: char) -> Option<u32> {
     })
 }
 
-pub struct Ast(Vec<AstNode>);
-pub struct AstGenerator<'a, L: LexerTrait>(pub &'a mut L);
-
-impl Ast {
-    pub fn try_from_lexer<'a, L: LexerTrait>(lexer: &mut L) -> Result<Self, ParsingError> {
+impl AstNode {
+    pub fn try_all_from_lexer<'a, L: LexerTrait>(lexer: &mut L) -> Result<Vec<Self>, ParsingError> {
         let mut ast = Vec::new();
         while let Some(node) = AstNode::try_from_lexer(lexer)? {
             ast.push(node);
         }
-        Ok(Ast(ast))
+        Ok(ast)
     }
 
-    pub fn try_from_str(s: &str) -> Result<Self, ParsingError> {
+    pub fn try_all_from_str(s: &str) -> Result<Vec<Self>, ParsingError> {
         let mut s_u8 = s.as_bytes();
         let mut lexer = Lexer::new(&mut s_u8);
-        Self::try_from_lexer(&mut lexer)
+        Self::try_all_from_lexer(&mut lexer)
     }
-}
 
-impl AstNode {
     pub fn try_from_lexer<'a, L: LexerTrait>(lexer: &mut L) -> Result<Option<Self>, ParsingError> {
         let node = loop {
             let next_token = lexer.cursor_next()?;
@@ -389,38 +386,38 @@ impl AstNode {
 
 #[cfg(test)]
 mod test {
-    use super::{Ast, AstNode, FnProto};
+    use super::{AstNode, FnProto};
     use crate::lexer::Lexer;
 
     #[test]
     fn parse_variable() {
         let var = "var".to_owned();
-        let ast = Ast::try_from_str(&var).unwrap();
+        let ast = AstNode::try_all_from_str(&var).unwrap();
         let expected = AstNode::Ident(var);
-        let parsed = ast.0.first().unwrap();
+        let parsed = ast.first().unwrap();
 
-        assert_eq!(ast.0.len(), 1);
+        assert_eq!(ast.len(), 1);
         assert_eq!(parsed, &expected.as_top_level());
     }
 
     #[test]
     fn parse_number() {
         let var = 1.123;
-        let ast = Ast::try_from_str(&var.to_string()).unwrap();
+        let ast = AstNode::try_all_from_str(&var.to_string()).unwrap();
         let expected = AstNode::Number(var);
-        let parsed = ast.0.first().unwrap();
+        let parsed = ast.first().unwrap();
 
-        assert_eq!(ast.0.len(), 1);
+        assert_eq!(ast.len(), 1);
         assert_eq!(parsed, &expected.as_top_level());
     }
 
     #[test]
     fn parse_def1() {
         let var = "def foo(x, y) x+foo(y, 4.0);";
-        let ast = Ast::try_from_str(&var.to_string()).unwrap();
+        let ast = AstNode::try_all_from_str(&var.to_string()).unwrap();
 
-        assert_eq!(ast.0.len(), 1);
-        match ast.0.first() {
+        assert_eq!(ast.len(), 1);
+        match ast.first() {
             Some(AstNode::FnDef(FnProto(fn_name, args), _)) => {
                 assert_eq!(fn_name, "foo");
                 assert_eq!(args.len(), 2);
@@ -437,10 +434,10 @@ mod test {
         let mut s_u8 = var.as_bytes();
         let mut lexer = Lexer::new(&mut s_u8);
         lexer.peek_nth(10).unwrap();
-        let ast = Ast::try_from_str(&var.to_string()).unwrap();
+        let ast = AstNode::try_all_from_str(&var.to_string()).unwrap();
 
-        assert_eq!(ast.0.len(), 1);
-        match ast.0.first() {
+        assert_eq!(ast.len(), 1);
+        match ast.first() {
             Some(AstNode::FnDef(FnProto(fn_name, args), _)) => {
                 assert_eq!(fn_name, "foo");
                 assert_eq!(args.len(), 1);
@@ -453,10 +450,10 @@ mod test {
     #[test]
     fn parse_extern() {
         let var = "extern sin(a);";
-        let ast = Ast::try_from_str(&var.to_string()).unwrap();
+        let ast = AstNode::try_all_from_str(&var.to_string()).unwrap();
 
-        assert_eq!(ast.0.len(), 1);
-        match ast.0.first() {
+        assert_eq!(ast.len(), 1);
+        match ast.first() {
             Some(AstNode::FnDec(FnProto(fn_name, args))) => {
                 assert_eq!(fn_name, "sin");
                 assert_eq!(args.len(), 1);
@@ -469,10 +466,10 @@ mod test {
     #[test]
     fn parse_def_and_toplevel() {
         let var = "def foo(x, y, z) x+y*z; y;";
-        let ast = Ast::try_from_str(&var.to_string()).unwrap();
+        let ast = AstNode::try_all_from_str(&var.to_string()).unwrap();
 
-        assert_eq!(ast.0.len(), 2);
-        match ast.0.first() {
+        assert_eq!(ast.len(), 2);
+        match ast.first() {
             Some(AstNode::FnDef(FnProto(fn_name, args), _)) => {
                 assert_eq!(fn_name, "foo");
                 assert_eq!(args.len(), 3);
@@ -483,17 +480,17 @@ mod test {
             _ => panic!("Wrong node type :("),
         }
 
-        assert_eq!(ast.0[1], AstNode::Ident("y".to_owned()).as_top_level());
+        assert_eq!(ast[1], AstNode::Ident("y".to_owned()).as_top_level());
     }
 
     #[test]
     fn parse_toplevel_expr() {
         let var = "x+y\n;z";
-        let ast = Ast::try_from_str(&var.to_string()).unwrap();
+        let ast = AstNode::try_all_from_str(&var.to_string()).unwrap();
 
-        assert_eq!(ast.0.len(), 2);
+        assert_eq!(ast.len(), 2);
         assert_eq!(
-            ast.0[0],
+            ast[0],
             AstNode::Binary(
                 '+',
                 AstNode::Ident("x".to_owned()).into(),
