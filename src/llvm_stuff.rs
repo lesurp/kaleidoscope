@@ -2,7 +2,7 @@ use llvm_sys;
 
 use crate::parser::{AstNode, FnProto};
 use log::debug;
-use std::ffi::{CStr, CString};
+use std::ffi::CString;
 
 pub struct LlvmStuff {
     context: *mut llvm_sys::LLVMContext,
@@ -12,11 +12,11 @@ pub struct LlvmStuff {
 }
 
 impl LlvmStuff {
-    pub fn new<S: AsRef<[u8]>>(s: S) -> Self {
+    pub fn new<S: AsRef<str>>(s: S) -> Self {
+        let c = CString::new(s.as_ref().as_bytes()).unwrap();
         let context = unsafe { llvm_sys::core::LLVMContextCreate() };
         assert!(!context.is_null());
-        let module =
-            unsafe { llvm_sys::core::LLVMModuleCreateWithName(s.as_ref().as_ptr() as *const _) };
+        let module = unsafe { llvm_sys::core::LLVMModuleCreateWithName(c.as_ptr() as *const _) };
         assert!(!module.is_null());
         let builder = unsafe { llvm_sys::core::LLVMCreateBuilderInContext(context) };
         assert!(!builder.is_null());
@@ -57,24 +57,18 @@ impl LlvmStuff {
                 fnc
             }
             Entry::Vacant(not_yet) => {
-                // TODO: strings are *not* null terminated in rust!
-                //let c_string = CString::from(&not_yet.key()[..]);
-                let fnc = llvm_sys::core::LLVMAddFunction(
-                    self.module,
-                    not_yet.key().as_ptr() as *const _,
-                    fn_proto,
-                );
+                let c = CString::new(not_yet.key().as_bytes()).unwrap();
+                let fnc =
+                    llvm_sys::core::LLVMAddFunction(self.module, c.as_ptr() as *const _, fn_proto);
                 *not_yet.insert(fnc)
             }
         };
+        assert!(!fnc.is_null());
 
-        let args_fnc = std::ptr::null_mut();
-        llvm_sys::core::LLVMGetParams(fnc, args_fnc);
-        if args_fnc.is_null() {
-            panic!("DUNNO");
-        }
-        for (i, arg_name) in proto.1.iter().enumerate() {
-            let arg = args_fnc.add(i);
+        let mut args_fnc = vec![std::ptr::null_mut(); proto.1.len()];
+        llvm_sys::core::LLVMGetParams(fnc, args_fnc.as_mut_ptr());
+
+        for (arg, arg_name) in args_fnc.iter().zip(proto.1.iter()) {
             llvm_sys::core::LLVMSetValueName2(*arg, arg_name.as_ptr() as *const _, arg_name.len());
             self.variables.insert(arg_name.clone(), *arg);
         }
@@ -138,8 +132,9 @@ impl LlvmStuff {
             }
             AstNode::Call(fnc, args) => {
                 debug!("from call");
+                let c = CString::new(fnc.as_bytes()).unwrap();
                 let fnc_ptr =
-                    llvm_sys::core::LLVMGetNamedFunction(self.module, fnc.as_ptr() as *const _);
+                    llvm_sys::core::LLVMGetNamedFunction(self.module, c.as_ptr() as *const _);
                 if fnc_ptr.is_null() {
                     panic!("Referred function was not defined: {}", fnc);
                 }
