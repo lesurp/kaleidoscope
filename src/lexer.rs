@@ -16,10 +16,28 @@ pub enum LexerToken {
     Kwd(char),
 }
 
-pub struct Lexer<'a, R: BufRead> {
+pub trait Newliner {
+    fn new_line(&self) {}
+}
+
+pub struct NoNewline;
+impl Newliner for NoNewline {}
+
+pub trait LexerTrait {
+    //fn token(&mut self) -> Result<Option<LexerToken>, LexingError>;
+    //fn peek(&mut self) -> Result<&Option<LexerToken>, LexingError>;
+    fn cursor_next(&mut self) -> Result<&Option<LexerToken>, LexingError>;
+    fn peek(&mut self) -> Result<&Option<LexerToken>, LexingError>;
+    fn consume(&mut self);
+    fn reset(&mut self);
+}
+
+pub struct Lexer<'a, R: BufRead, N: Newliner = NoNewline> {
     input: &'a mut R,
     toparse_buf: String,
-    pub parsed_buf: Vec<Option<LexerToken>>,
+    newliner: N,
+    parsed_buf: Vec<Option<LexerToken>>,
+    cursor: Option<usize>,
 }
 
 fn is_ident_accepted(c: char) -> bool {
@@ -67,45 +85,31 @@ fn parse_token(s: &str) -> nom::IResult<&str, LexerToken> {
     nom::branch::alt((take_ident, take_kwd, take_double))(s)
 }
 
-pub struct LexerTokenView<'a, 'b, R: BufRead>(&'a mut Lexer<'b, R>);
-impl<'a, 'b, R: BufRead> LexerTokenView<'a, 'b, R> {
-    pub fn peek(&self) -> Option<&LexerToken> {
-        self.0.parsed_buf.first().unwrap().as_ref()
-    }
-
-    pub fn consume(self) -> Option<LexerToken> {
-        self.0.parsed_buf.remove(0)
-    }
-}
-
 impl<'a, R: BufRead> Lexer<'a, R> {
     pub fn new(input: &'a mut R) -> Self {
         Lexer {
             input,
             toparse_buf: String::new(),
             parsed_buf: Vec::new(),
+            newliner: NoNewline,
+            cursor: None,
+        }
+    }
+}
+
+impl<'a, R: BufRead, N: Newliner> Lexer<'a, R, N> {
+    pub fn with_newliner(input: &'a mut R, newliner: N) -> Self {
+        Lexer {
+            input,
+            toparse_buf: String::new(),
+            parsed_buf: Vec::new(),
+            newliner,
+            cursor: None,
         }
     }
 
     fn are_leftovers_trivial(&self) -> bool {
         self.toparse_buf.is_empty() || self.toparse_buf.trim_start().is_empty()
-    }
-
-    pub fn token_view<'b>(&'b mut self) -> Result<LexerTokenView<'b, 'a, R>, LexingError> {
-        self.peek()?;
-        Ok(LexerTokenView(self))
-    }
-
-    pub fn token(&mut self) -> Result<Option<LexerToken>, LexingError> {
-        if self.parsed_buf.is_empty() {
-            self.next_token()
-        } else {
-            Ok(self.parsed_buf.remove(0))
-        }
-    }
-
-    pub fn peek(&mut self) -> Result<&Option<LexerToken>, LexingError> {
-        self.peek_nth(0)
     }
 
     pub fn peek_nth(&mut self, n: usize) -> Result<&Option<LexerToken>, LexingError> {
@@ -130,6 +134,7 @@ impl<'a, R: BufRead> Lexer<'a, R> {
             // Line is not complete apparently, grabbing a new one
             Err(nom::Err::Error(_)) => {
                 let mut line = String::new();
+                self.newliner.new_line();
                 match self.input.read_line(&mut line) {
                     Ok(0) => {
                         if self.are_leftovers_trivial() {
@@ -166,6 +171,30 @@ impl<'a, R: BufRead> Lexer<'a, R> {
 
         // hopefully it's gonna be tail-recursion optimized 😁
         self.next_token()
+    }
+}
+
+impl<'a, R: BufRead, N: Newliner> LexerTrait for Lexer<'a, R, N> {
+    fn cursor_next(&mut self) -> Result<&Option<LexerToken>, LexingError> {
+        let cursor = self.cursor.map_or(0, |cursor| cursor + 1);
+        self.cursor = Some(cursor);
+        self.peek_nth(cursor)
+    }
+
+    fn peek(&mut self) -> Result<&Option<LexerToken>, LexingError> {
+        self.peek_nth(self.cursor.map_or(0, |cursor| cursor + 1))
+    }
+
+    fn consume(&mut self) {
+        let cursor = self
+            .cursor
+            .expect("Calling consume() on a lexer without actually consuming anything");
+        self.parsed_buf.drain(0..cursor + 1);
+        self.cursor = None;
+    }
+
+    fn reset(&mut self) {
+        self.cursor = None;
     }
 }
 

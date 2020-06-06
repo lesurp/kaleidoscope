@@ -1,9 +1,9 @@
-use crate::lexer::{Lexer, LexerToken, LexingError};
-use std::io::BufRead;
+use crate::lexer::{Lexer, LexerToken, LexerTrait, LexingError};
+use log::debug;
 use std::ops::{Generator, GeneratorState};
 use std::pin::Pin;
 
-impl<'a, R: BufRead> Generator for AstGenerator<'a, R> {
+impl<'a, L: LexerTrait> Generator for AstGenerator<'a, L> {
     type Yield = Result<AstNode, ParsingError>;
     type Return = ();
     fn resume(self: Pin<&mut Self>, _: ()) -> GeneratorState<Self::Yield, Self::Return> {
@@ -15,9 +15,9 @@ impl<'a, R: BufRead> Generator for AstGenerator<'a, R> {
     }
 }
 
-impl<'a, R: BufRead> IntoIterator for AstGenerator<'a, R> {
+impl<'a, L: LexerTrait> IntoIterator for AstGenerator<'a, L> {
     type Item = Result<AstNode, ParsingError>;
-    type IntoIter = GeneratorIteratorAdapter<AstGenerator<'a, R>>;
+    type IntoIter = GeneratorIteratorAdapter<AstGenerator<'a, L>>;
     fn into_iter(self) -> Self::IntoIter {
         GeneratorIteratorAdapter(Box::pin(self))
     }
@@ -38,6 +38,15 @@ impl<G: Generator> Iterator for GeneratorIteratorAdapter<G> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParsingError {
     LexingError(LexingError),
+    IncompleteAstError,
+    FatalError(FatalError),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IncompleteAstError {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FatalError {
     ExpectedIdent,
     ExpectedCommaOrClosingParenthesis,
     ExpectedClosingParenthesis,
@@ -52,8 +61,14 @@ impl From<LexingError> for ParsingError {
     }
 }
 
+impl From<FatalError> for ParsingError {
+    fn from(l: FatalError) -> Self {
+        ParsingError::FatalError(l)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FnProto(String, Vec<String>);
+pub struct FnProto(pub String, pub Vec<String>);
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum AstNode {
@@ -76,10 +91,10 @@ fn precedence(c: char) -> Option<u32> {
 }
 
 pub struct Ast(Vec<AstNode>);
-pub struct AstGenerator<'a, R: BufRead>(pub &'a mut Lexer<'a, R>);
+pub struct AstGenerator<'a, L: LexerTrait>(pub &'a mut L);
 
 impl Ast {
-    pub fn try_from_lexer<'a, R: BufRead>(lexer: &mut Lexer<'a, R>) -> Result<Self, ParsingError> {
+    pub fn try_from_lexer<'a, L: LexerTrait>(lexer: &mut L) -> Result<Self, ParsingError> {
         let mut ast = Vec::new();
         while let Some(node) = AstNode::try_from_lexer(lexer)? {
             ast.push(node);
@@ -95,176 +110,279 @@ impl Ast {
 }
 
 impl AstNode {
-    pub fn try_from_lexer<'a, R: BufRead>(
-        lexer: &mut Lexer<'a, R>,
-    ) -> Result<Option<Self>, ParsingError> {
-        loop {
-            match lexer.peek()? {
-                None => return Ok(None),
-                Some(LexerToken::Kwd(';')) => {
-                    lexer.token().unwrap();
+    pub fn try_from_lexer<'a, L: LexerTrait>(lexer: &mut L) -> Result<Option<Self>, ParsingError> {
+        let node = loop {
+            let next_token = lexer.cursor_next()?;
+            debug!("next_token to feed to the ast builder: {:?}", next_token);
+            match next_token {
+                None => break Ok(None),
+                Some(LexerToken::Kwd(';')) => {}
+                Some(LexerToken::Extern) => break AstNode::parse_extern(lexer).map(|n| Some(n)),
+                Some(LexerToken::Def) => break AstNode::parse_definition(lexer).map(|n| Some(n)),
+                Some(token) => {
+                    let token = token.clone();
+                    break AstNode::parse_toplevel(lexer, token).map(|n| Some(n));
                 }
-                Some(LexerToken::Extern) => return AstNode::parse_extern(lexer).map(|n| Some(n)),
-                Some(LexerToken::Def) => return AstNode::parse_definition(lexer).map(|n| Some(n)),
-                Some(_) => return AstNode::parse_toplevel(lexer).map(|n| Some(n)),
             }
+        };
+
+        match &node {
+            Ok(n) => {
+                debug!(
+                    "A node was built, consuming the corresponding lexer tokens: {:?}",
+                    n
+                );
+                lexer.consume();
+            }
+            Err(ParsingError::IncompleteAstError) => {
+                debug!("AST node possibly incomplete - reet the lexer");
+                lexer.reset()
+            }
+            _ => {}
         }
+
+        node
     }
 
-    /// For testing!
+    #[cfg(test)]
     fn as_top_level(self) -> Self {
         AstNode::FnDef(FnProto("".to_owned(), Vec::new()), self.into())
     }
 
-    fn parse_raw_ident<R: BufRead>(lexer: &mut Lexer<R>) -> Result<String, ParsingError> {
-        match lexer.token()? {
-            Some(LexerToken::Ident(i)) => Ok(i),
-            _ => Err(ParsingError::ExpectedIdent),
+    fn parse_raw_ident<L: LexerTrait>(lexer: &mut L) -> Result<String, ParsingError> {
+        debug!("parse_raw_ident");
+        match lexer.cursor_next()? {
+            Some(LexerToken::Ident(i)) => Ok(i.clone()),
+            Some(_) => Err(ParsingError::FatalError(FatalError::ExpectedIdent)),
+            None => Err(ParsingError::IncompleteAstError),
         }
     }
 
-    fn parse_raw_operator<R: BufRead>(lexer: &mut Lexer<R>) -> Result<char, ParsingError> {
-        match lexer.token()? {
-            Some(LexerToken::Kwd(c)) => match precedence(c) {
-                Some(_) => Ok(c),
-                None => Err(ParsingError::ExpectedBinaryOperator),
+    fn parse_raw_operator<L: LexerTrait>(lexer: &mut L) -> Result<char, ParsingError> {
+        debug!("parse_raw_operator");
+        let next = lexer.cursor_next()?;
+        debug!("next: {:?}", next);
+        match next {
+            Some(LexerToken::Kwd(c)) => match precedence(*c) {
+                Some(_) => Ok(*c),
+                None => Err(ParsingError::FatalError(FatalError::ExpectedBinaryOperator)),
             },
-            _ => Err(ParsingError::ExpectedBinaryOperator),
+            Some(_) => Err(ParsingError::FatalError(FatalError::ExpectedBinaryOperator)),
+            None => Err(ParsingError::IncompleteAstError),
         }
     }
 
-    fn parse_number<R: BufRead>(_: &mut Lexer<R>, t: f64) -> Result<Self, ParsingError> {
+    fn parse_number<L: LexerTrait>(_: &mut L, t: f64) -> Result<Self, ParsingError> {
+        debug!("parse_number");
         Ok(AstNode::Number(t))
     }
 
-    fn parse_call_parameters<R: BufRead>(lexer: &mut Lexer<R>) -> Result<Vec<Self>, ParsingError> {
-        assert!(matches!(lexer.token(), Ok(Some(LexerToken::Kwd('(')))));
-
+    fn parse_call_parameters<L: LexerTrait>(lexer: &mut L) -> Result<Vec<Self>, ParsingError> {
+        debug!("parse_call_parameters");
         let mut elems = Vec::new();
         loop {
             elems.push(AstNode::parse_primary(lexer)?);
 
-            match lexer.token()? {
+            match lexer.cursor_next()? {
                 Some(LexerToken::Kwd(',')) => {}
                 Some(LexerToken::Kwd(')')) => return Ok(elems),
                 // expected comma/parenthesis after expression
-                _ => return Err(ParsingError::ExpectedCommaOrClosingParenthesis),
+                Some(_) => {
+                    return Err(ParsingError::FatalError(
+                        FatalError::ExpectedCommaOrClosingParenthesis,
+                    ))
+                }
+                None => return Err(ParsingError::IncompleteAstError),
             }
         }
     }
 
-    fn parse_primary<R: BufRead>(lexer: &mut Lexer<R>) -> Result<Self, ParsingError> {
-        match lexer.token()? {
+    fn parse_primary_with_token<L: LexerTrait>(
+        lexer: &mut L,
+        next: Option<LexerToken>,
+    ) -> Result<Self, ParsingError> {
+        debug!("parse_primary_with_token");
+        debug!("Next token: {:?}", next);
+        match next {
             Some(LexerToken::Number(n)) => AstNode::parse_number(lexer, n),
             Some(LexerToken::Ident(i)) => {
                 if matches!(lexer.peek()?, Some(LexerToken::Kwd('('))) {
+                    lexer.cursor_next()?; // consume the opening parenthesis
                     Ok(AstNode::Call(i, AstNode::parse_call_parameters(lexer)?))
                 } else {
+                    debug!("Returning mah ident");
                     Ok(AstNode::Ident(i))
                 }
             }
             Some(LexerToken::Kwd('(')) => {
                 let node = AstNode::parse_expr(lexer);
-                if matches!(lexer.token()?, Some(LexerToken::Kwd(')'))) {
-                    node
-                } else {
-                    // expecting closnig ')'
-                    Err(ParsingError::ExpectedClosingParenthesis)
+                match lexer.cursor_next()? {
+                    Some(LexerToken::Kwd(')')) => node,
+                    Some(_) => Err(ParsingError::FatalError(
+                        FatalError::ExpectedClosingParenthesis,
+                    )),
+                    None => Err(ParsingError::IncompleteAstError),
                 }
             }
-            _ => Err(ParsingError::ExpectedPrimaryExpression),
+            Some(_) => Err(ParsingError::FatalError(
+                FatalError::ExpectedPrimaryExpression,
+            )),
+            None => Err(ParsingError::IncompleteAstError),
         }
     }
 
-    fn parse_expr<R: BufRead>(lexer: &mut Lexer<R>) -> Result<Self, ParsingError> {
-        let lhs = AstNode::parse_primary(lexer)?;
-        println!("lhs: {:?}", lhs);
-        println!("peek: {:?}", lexer.peek()?);
+    fn parse_primary<L: LexerTrait>(lexer: &mut L) -> Result<Self, ParsingError> {
+        debug!("parse_primary");
+        let next = lexer.cursor_next()?.clone();
+        AstNode::parse_primary_with_token(lexer, next)
+    }
+
+    fn parse_expr_with_token<L: LexerTrait>(
+        lexer: &mut L,
+        token: LexerToken,
+    ) -> Result<Self, ParsingError> {
+        debug!("parse_expr_with_token");
+        AstNode::parse_expr_with_opt_token(lexer, Some(token))
+    }
+
+    fn parse_expr_with_opt_token<L: LexerTrait>(
+        lexer: &mut L,
+        token: Option<LexerToken>,
+    ) -> Result<Self, ParsingError> {
+        debug!("parse_expr_with_opt_token");
+        let lhs = AstNode::parse_primary_with_token(lexer, token)?;
+        debug!("lhs: {:?}", lhs);
         match lexer.peek()? {
-            Some(LexerToken::Kwd(c)) => match precedence(*c) {
-                Some(_) => AstNode::parse_expr_rec(lexer, lhs),
-                None => Ok(lhs),
-            },
+            Some(LexerToken::Kwd(c)) => {
+                debug!("Next token is a keyword with char: {}", c);
+                match precedence(*c) {
+                    Some(val) => {
+                        debug!(
+                            "This char has a precedence ({}), recursing into the expression...",
+                            val
+                        );
+                        let c = *c;
+
+                        // Important!
+                        // We consume the token if it's a binary operator, otherwise we let it be parsed for the next step.
+                        // This could be a semi column, a comma, a parenthesis etc.
+                        lexer.cursor_next()?;
+                        AstNode::parse_expr_rec_with_op(lexer, lhs, c)
+                    }
+                    None => Ok(lhs),
+                }
+            }
             _ => return Ok(lhs),
         }
     }
 
-    fn parse_expr_rec<R: BufRead>(
-        lexer: &mut Lexer<R>,
+    fn parse_expr<L: LexerTrait>(lexer: &mut L) -> Result<Self, ParsingError> {
+        debug!("parse_expr");
+        let token = lexer.cursor_next()?.clone();
+        AstNode::parse_expr_with_opt_token(lexer, token)
+    }
+
+    fn parse_expr_rec_with_op<L: LexerTrait>(
+        lexer: &mut L,
         lhs: AstNode,
+        op: char,
     ) -> Result<Self, ParsingError> {
-        let prev_op = AstNode::parse_raw_operator(lexer)?;
+        debug!("parsed operator: {}", op);
         let rhs = AstNode::parse_primary(lexer)?;
+        debug!("parsed rhs: {:?}", rhs);
         match lexer.peek()? {
             Some(LexerToken::Kwd(c)) => {
                 Ok(match precedence(*c) {
                     Some(prec_next) => {
-                        let should_nomnom = prec_next > precedence(prev_op).unwrap();
+                        let should_nomnom = prec_next > precedence(op).unwrap();
                         // keep nomnom'ing if precedence is higher e.g. a + b * c
                         // then our new rhs is the recursively parsed b * c
                         if should_nomnom {
                             let rhs = AstNode::parse_expr_rec(lexer, rhs)?;
-                            AstNode::Binary(prev_op, lhs.into(), rhs.into())
+                            AstNode::Binary(op, lhs.into(), rhs.into())
                         }
                         // otherwise; e.g. a * b + c,
-                        // we replace the lhs with the already parsed binary expr <=> lhs prev_op rhs,
+                        // we replace the lhs with the already parsed binary expr <=> lhs op rhs,
                         // and we parse another rhs
                         else {
-                            let lhs = AstNode::Binary(prev_op, lhs.into(), rhs.into());
+                            let lhs = AstNode::Binary(op, lhs.into(), rhs.into());
                             AstNode::parse_expr_rec(lexer, lhs)?
                         }
                     }
 
-                    None => AstNode::Binary(prev_op, lhs.into(), rhs.into()),
+                    None => AstNode::Binary(op, lhs.into(), rhs.into()),
                 })
             }
-            _ => return Ok(lhs),
+            _ => Ok(AstNode::Binary(op, lhs.into(), rhs.into())),
         }
     }
 
-    fn parse_prototype<R: BufRead>(lexer: &mut Lexer<R>) -> Result<FnProto, ParsingError> {
-        Ok(FnProto(
-            AstNode::parse_raw_ident(lexer)?,
-            AstNode::parse_prototype_args(lexer)?,
-        ))
+    fn parse_expr_rec<L: LexerTrait>(lexer: &mut L, lhs: AstNode) -> Result<Self, ParsingError> {
+        debug!("parse_expr_rec");
+        let prev_op = AstNode::parse_raw_operator(lexer)?;
+        AstNode::parse_expr_rec_with_op(lexer, lhs, prev_op)
     }
 
-    fn parse_prototype_args<R: BufRead>(lexer: &mut Lexer<R>) -> Result<Vec<String>, ParsingError> {
-        if !matches!(lexer.token()?, Some(LexerToken::Kwd('('))) {
-            // expected (
-            return Err(ParsingError::ExpectedOpeningParenthesis);
+    fn parse_prototype<L: LexerTrait>(lexer: &mut L) -> Result<FnProto, ParsingError> {
+        debug!("parse_prototype");
+        let fn_name = AstNode::parse_raw_ident(lexer)?;
+        debug!("function name: {}", fn_name);
+        let fn_args = AstNode::parse_prototype_args(lexer)?;
+        debug!("function args: {:?}", fn_args);
+        Ok(FnProto(fn_name, fn_args))
+    }
+
+    fn parse_prototype_args<L: LexerTrait>(lexer: &mut L) -> Result<Vec<String>, ParsingError> {
+        debug!("parse_prototype_args");
+        match lexer.cursor_next()? {
+            Some(LexerToken::Kwd('(')) => {}
+            Some(_) => {
+                return Err(ParsingError::FatalError(
+                    FatalError::ExpectedOpeningParenthesis,
+                ))
+            }
+            None => return Err(ParsingError::IncompleteAstError),
         }
 
         let mut elems = Vec::new();
         loop {
             elems.push(AstNode::parse_raw_ident(lexer)?);
 
-            match lexer.token()? {
+            match lexer.cursor_next()? {
                 Some(LexerToken::Kwd(',')) => {}
                 Some(LexerToken::Kwd(')')) => return Ok(elems),
                 // expected comma/parenthesis after expression
-                _ => return Err(ParsingError::ExpectedCommaOrClosingParenthesis),
+                Some(_) => {
+                    return Err(ParsingError::FatalError(
+                        FatalError::ExpectedCommaOrClosingParenthesis,
+                    ))
+                }
+                None => return Err(ParsingError::IncompleteAstError),
             }
         }
     }
 
-    fn parse_definition<R: BufRead>(lexer: &mut Lexer<R>) -> Result<Self, ParsingError> {
-        assert!(matches!(lexer.token(), Ok(Some(LexerToken::Def))));
+    fn parse_definition<L: LexerTrait>(lexer: &mut L) -> Result<Self, ParsingError> {
+        debug!("parse_definition");
         Ok(AstNode::FnDef(
             AstNode::parse_prototype(lexer)?,
             AstNode::parse_expr(lexer)?.into(),
         ))
     }
 
-    fn parse_extern<R: BufRead>(lexer: &mut Lexer<R>) -> Result<Self, ParsingError> {
-        assert!(matches!(lexer.token(), Ok(Some(LexerToken::Extern))));
+    fn parse_extern<L: LexerTrait>(lexer: &mut L) -> Result<Self, ParsingError> {
+        debug!("parse_extern");
         Ok(AstNode::FnDec(AstNode::parse_prototype(lexer)?))
     }
 
-    fn parse_toplevel<R: BufRead>(lexer: &mut Lexer<R>) -> Result<Self, ParsingError> {
+    fn parse_toplevel<L: LexerTrait>(
+        lexer: &mut L,
+        token: LexerToken,
+    ) -> Result<Self, ParsingError> {
+        debug!("parse_toplevel");
         Ok(AstNode::FnDef(
             FnProto("".to_owned(), Vec::new()),
-            AstNode::parse_expr(lexer)?.into(),
+            AstNode::parse_expr_with_token(lexer, token)?.into(),
         ))
     }
 }
@@ -297,8 +415,8 @@ mod test {
     }
 
     #[test]
-    fn parse_def() {
-        let var = "def foo(x, y) x+foo(y, 4.0);"; // from LLVM's site :)
+    fn parse_def1() {
+        let var = "def foo(x, y) x+foo(y, 4.0);";
         let ast = Ast::try_from_str(&var.to_string()).unwrap();
 
         assert_eq!(ast.0.len(), 1);
@@ -319,7 +437,6 @@ mod test {
         let mut s_u8 = var.as_bytes();
         let mut lexer = Lexer::new(&mut s_u8);
         lexer.peek_nth(10).unwrap();
-        println!("{:?}", lexer.parsed_buf);
         let ast = Ast::try_from_str(&var.to_string()).unwrap();
 
         assert_eq!(ast.0.len(), 1);
@@ -335,7 +452,7 @@ mod test {
 
     #[test]
     fn parse_extern() {
-        let var = "extern sin(a);"; // from LLVM's site :)
+        let var = "extern sin(a);";
         let ast = Ast::try_from_str(&var.to_string()).unwrap();
 
         assert_eq!(ast.0.len(), 1);
@@ -351,7 +468,7 @@ mod test {
 
     #[test]
     fn parse_def_and_toplevel() {
-        let var = "def foo(x, y, z) x+y*z y;"; // from LLVM's site :)
+        let var = "def foo(x, y, z) x+y*z; y;";
         let ast = Ast::try_from_str(&var.to_string()).unwrap();
 
         assert_eq!(ast.0.len(), 2);
@@ -367,5 +484,22 @@ mod test {
         }
 
         assert_eq!(ast.0[1], AstNode::Ident("y".to_owned()).as_top_level());
+    }
+
+    #[test]
+    fn parse_toplevel_expr() {
+        let var = "x+y\n;z";
+        let ast = Ast::try_from_str(&var.to_string()).unwrap();
+
+        assert_eq!(ast.0.len(), 2);
+        assert_eq!(
+            ast.0[0],
+            AstNode::Binary(
+                '+',
+                AstNode::Ident("x".to_owned()).into(),
+                AstNode::Ident("y".to_owned()).into()
+            )
+            .as_top_level()
+        );
     }
 }
