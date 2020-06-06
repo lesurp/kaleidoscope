@@ -24,8 +24,6 @@ pub struct NoNewline;
 impl Newliner for NoNewline {}
 
 pub trait LexerTrait {
-    //fn token(&mut self) -> Result<Option<LexerToken>, LexingError>;
-    //fn peek(&mut self) -> Result<&Option<LexerToken>, LexingError>;
     fn cursor_next(&mut self) -> Result<&Option<LexerToken>, LexingError>;
     fn peek(&mut self) -> Result<&Option<LexerToken>, LexingError>;
     fn consume(&mut self);
