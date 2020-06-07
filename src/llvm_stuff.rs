@@ -166,11 +166,8 @@ impl LlvmStuff {
                         args.len()
                     );
                 }
-                let params = std::ptr::null_mut();
-                llvm_sys::core::LLVMGetParams(fnc_ptr, params);
-                if params.is_null() {
-                    panic!("NOOOOO CLUUUUUE");
-                }
+
+                assert_eq!(llvm_sys::core::LLVMCountParams(fnc_ptr), args.len() as u32);
                 let mut args: Vec<_> = args
                     .into_iter()
                     .map(|arg| self.ast_node_to_llvm(arg))
