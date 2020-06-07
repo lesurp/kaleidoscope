@@ -88,12 +88,29 @@ impl LlvmStuff {
             }
             AstNode::Binary(op, lhs, rhs) => {
                 debug!("from binary");
-                let fn_name = match op {
-                    '+' => "sum\0",
+                let fn_name;
+                let builder_fn: unsafe extern "C" fn(_, _, _, _) -> _;
+                match op {
+                    '+' => {
+                        builder_fn = llvm_sys::core::LLVMBuildFAdd;
+                        fn_name = "sum\0";
+                    }
+                    '-' => {
+                        builder_fn = llvm_sys::core::LLVMBuildFSub;
+                        fn_name = "sub\0";
+                    }
+                    '*' => {
+                        builder_fn = llvm_sys::core::LLVMBuildFMul;
+                        fn_name = "mul\0";
+                    }
+                    '/' => {
+                        builder_fn = llvm_sys::core::LLVMBuildFDiv;
+                        fn_name = "div\0";
+                    }
                     _ => todo!(),
                 };
 
-                llvm_sys::core::LLVMBuildFAdd(
+                builder_fn(
                     self.builder,
                     self.ast_node_to_llvm(*lhs),
                     self.ast_node_to_llvm(*rhs),
