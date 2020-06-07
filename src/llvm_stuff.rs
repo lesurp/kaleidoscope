@@ -4,11 +4,49 @@ use crate::parser::{AstNode, FnProto};
 use log::debug;
 use std::ffi::CString;
 
+pub struct LlvmJit {
+    execution: llvm_sys::execution_engine::LLVMExecutionEngineRef,
+    fpm: *mut llvm_sys::LLVMPassManager,
+}
+
+impl LlvmJit {
+    pub unsafe fn new(module: *mut llvm_sys::LLVMModule) -> Self {
+        let mut execution = std::ptr::null_mut();
+        let mut err = std::ptr::null_mut();
+        let ok = llvm_sys::execution_engine::LLVMCreateExecutionEngineForModule(
+            &mut execution,
+            module,
+            &mut err,
+        );
+        if ok != 0 {
+            panic!("{:?}", CString::from_raw(err));
+        }
+        assert_eq!(ok, 0);
+
+        llvm_sys::execution_engine::LLVMLinkInInterpreter();
+
+        let module_provider = llvm_sys::core::LLVMCreateModuleProviderForExistingModule(module);
+        let fpm = llvm_sys::core::LLVMCreateFunctionPassManager(module_provider);
+
+        let target_data = llvm_sys::execution_engine::LLVMGetExecutionEngineTargetData(execution);
+        llvm_sys::target::LLVMSetModuleDataLayout(module, target_data);
+        llvm_sys::transforms::instcombine::LLVMAddInstructionCombiningPass(fpm);
+        llvm_sys::transforms::scalar::LLVMAddReassociatePass(fpm);
+        llvm_sys::transforms::scalar::LLVMAddGVNPass(fpm);
+        llvm_sys::transforms::scalar::LLVMAddCFGSimplificationPass(fpm);
+
+        llvm_sys::core::LLVMInitializeFunctionPassManager(fpm);
+
+        LlvmJit { execution, fpm }
+    }
+}
+
 pub struct LlvmStuff {
     context: *mut llvm_sys::LLVMContext,
     builder: *mut llvm_sys::LLVMBuilder,
     module: *mut llvm_sys::LLVMModule,
     variables: std::collections::HashMap<String, *mut llvm_sys::LLVMValue>,
+    jit: LlvmJit,
 }
 
 impl LlvmStuff {
@@ -16,17 +54,19 @@ impl LlvmStuff {
         let c = CString::new(s.as_ref().as_bytes()).unwrap();
         let context = unsafe { llvm_sys::core::LLVMContextCreate() };
         assert!(!context.is_null());
-        let module = unsafe {
-            llvm_sys::core::LLVMModuleCreateWithNameInContext(c.as_ptr() as *const _, context)
-        };
+        let module =
+            unsafe { llvm_sys::core::LLVMModuleCreateWithNameInContext(c.as_ptr(), context) };
         assert!(!module.is_null());
         let builder = unsafe { llvm_sys::core::LLVMCreateBuilderInContext(context) };
         assert!(!builder.is_null());
+
+        let jit = unsafe { LlvmJit::new(module) };
         LlvmStuff {
             context,
             module,
             builder,
             variables: std::collections::HashMap::new(),
+            jit,
         }
     }
 
@@ -60,8 +100,7 @@ impl LlvmStuff {
             }
             Entry::Vacant(not_yet) => {
                 let c = CString::new(not_yet.key().as_bytes()).unwrap();
-                let fnc =
-                    llvm_sys::core::LLVMAddFunction(self.module, c.as_ptr() as *const _, fn_proto);
+                let fnc = llvm_sys::core::LLVMAddFunction(self.module, c.as_ptr(), fn_proto);
                 *not_yet.insert(fnc)
             }
         };
@@ -139,6 +178,9 @@ impl LlvmStuff {
                     0
                 );
 
+                llvm_sys::core::LLVMRunFunctionPassManager(self.jit.fpm, fnc);
+
+
                 fnc
             }
             AstNode::FnDec(proto) => {
@@ -152,8 +194,7 @@ impl LlvmStuff {
             AstNode::Call(fnc, args) => {
                 debug!("from call");
                 let c = CString::new(fnc.as_bytes()).unwrap();
-                let fnc_ptr =
-                    llvm_sys::core::LLVMGetNamedFunction(self.module, c.as_ptr() as *const _);
+                let fnc_ptr = llvm_sys::core::LLVMGetNamedFunction(self.module, c.as_ptr());
                 if fnc_ptr.is_null() {
                     panic!("Referred function was not defined: {}", fnc);
                 }
