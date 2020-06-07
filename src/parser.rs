@@ -88,6 +88,7 @@ fn precedence(c: char) -> Option<u32> {
         '+' => 20,
         '-' => 20,
         '*' => 40,
+        '/' => 40,
         _ => return None,
     })
 }
