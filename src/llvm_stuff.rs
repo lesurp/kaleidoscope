@@ -119,7 +119,7 @@ impl LlvmStuff {
                         fnc,
                         llvm_sys::analysis::LLVMVerifierFailureAction::LLVMPrintMessageAction
                     ),
-                    1
+                    0
                 );
 
                 fnc
