@@ -16,7 +16,9 @@ impl LlvmStuff {
         let c = CString::new(s.as_ref().as_bytes()).unwrap();
         let context = unsafe { llvm_sys::core::LLVMContextCreate() };
         assert!(!context.is_null());
-        let module = unsafe { llvm_sys::core::LLVMModuleCreateWithName(c.as_ptr() as *const _) };
+        let module = unsafe {
+            llvm_sys::core::LLVMModuleCreateWithNameInContext(c.as_ptr() as *const _, context)
+        };
         assert!(!module.is_null());
         let builder = unsafe { llvm_sys::core::LLVMCreateBuilderInContext(context) };
         assert!(!builder.is_null());
